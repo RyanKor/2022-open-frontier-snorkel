@@ -1,0 +1,2589 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 🚀 Snorkel Intro Tutorial: Data Labeling"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this tutorial, we will walk through the process of using Snorkel to build a training set for classifying YouTube comments as spam or not spam.\n",
+    "The goal of this tutorial is to illustrate the basic components and concepts of Snorkel in a simple way, but also to dive into the actual process of iteratively developing real applications in Snorkel.\n",
+    "\n",
+    "**Note that this is a toy dataset that helps highlight the different features of Snorkel. For examples of high-performance, real-world uses of Snorkel, see [our publications list](https://www.snorkel.org/resources/).**\n",
+    "\n",
+    "Additionally:\n",
+    "* For an overview of Snorkel, visit [snorkel.org](https://snorkel.org)\n",
+    "* You can also check out the [Snorkel API documentation](https://snorkel.readthedocs.io/)\n",
+    "\n",
+    "Our goal is to train a classifier over the comment data that can predict whether a comment is spam or not spam.\n",
+    "We have access to a large amount of *unlabeled data* in the form of YouTube comments with some metadata.\n",
+    "In order to train a classifier, we need to label our data, but doing so by hand for real world applications can often be prohibitively slow and expensive.\n",
+    "\n",
+    "In these cases, we can turn to a _weak supervision_ approach, using **_labeling functions (LFs)_** in Snorkel: noisy, programmatic rules and heuristics that assign labels to unlabeled training data.\n",
+    "We'll dive into the Snorkel API and how we write labeling functions later in this tutorial, but as an example,\n",
+    "we can write an LF that labels data points with `\"http\"` in the comment text as spam since many spam\n",
+    "comments contain links:\n",
+    "\n",
+    "```python\n",
+    "from snorkel.labeling import labeling_function\n",
+    "\n",
+    "@labeling_function()\n",
+    "def lf_contains_link(x):\n",
+    "    # Return a label of SPAM if \"http\" in comment text, otherwise ABSTAIN\n",
+    "    return SPAM if \"http\" in x.text.lower() else ABSTAIN\n",
+    "```\n",
+    "\n",
+    "The tutorial is divided into four parts:\n",
+    "1. **Loading Data**: We load a [YouTube comments dataset](http://www.dt.fee.unicamp.br/~tiago//youtubespamcollection/), originally introduced in [\"TubeSpam: Comment Spam Filtering on YouTube\"](https://ieeexplore.ieee.org/document/7424299/), ICMLA'15 (T.C. Alberto, J.V. Lochter, J.V. Almeida).\n",
+    "\n",
+    "2. **Writing Labeling Functions**: We write Python programs that take as input a data point and assign labels (or abstain) using heuristics, pattern matching, and third-party models.\n",
+    "\n",
+    "3. **Combining Labeling Function Outputs with the Label Model**: We model the outputs of the labeling functions over the training set using a novel, theoretically-grounded [modeling approach](https://arxiv.org/abs/1605.07723), which estimates the accuracies and correlations of the labeling functions using only their agreements and disagreements, and then uses this to reweight and combine their outputs, which we then use as _probabilistic_ training labels.\n",
+    "\n",
+    "4. **Training a Classifier**: We train a classifier that can predict labels for *any* YouTube comment (not just the ones labeled by the labeling functions) using the probabilistic training labels from step 3."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task: Spam Detection"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We use a [YouTube comments dataset](http://www.dt.fee.unicamp.br/~tiago//youtubespamcollection/) that consists of YouTube comments from 5 videos. The task is to classify each comment as being\n",
+    "\n",
+    "* **`HAM`**: comments relevant to the video (even very simple ones), or\n",
+    "* **`SPAM`**: irrelevant (often trying to advertise something) or inappropriate messages\n",
+    "\n",
+    "For example, the following comments are `SPAM`:\n",
+    "\n",
+    "        \"Subscribe to me for free Android games, apps..\"\n",
+    "\n",
+    "        \"Please check out my vidios\"\n",
+    "\n",
+    "        \"Subscribe to me and I'll subscribe back!!!\"\n",
+    "\n",
+    "and these are `HAM`:\n",
+    "\n",
+    "        \"3:46 so cute!\"\n",
+    "\n",
+    "        \"This looks so fun and it's a good song\"\n",
+    "\n",
+    "        \"This is a weird video.\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Data Splits in Snorkel\n",
+    "\n",
+    "We split our data into two sets:\n",
+    "* **Training Set**: The largest split of the dataset, and the one without any ground truth (\"gold\") labels.\n",
+    "We will generate labels for these data points with weak supervision.\n",
+    "* **Test Set**: A small, standard held-out blind hand-labeled set for final evaluation of our classifier. This set should only be used for final evaluation, _not_ error analysis.\n",
+    "\n",
+    "Note that in more advanced production settings, we will often further split up the available hand-labeled data into a _development split_, for getting ideas to write labeling functions, and a _validation split_ for e.g. checking our performance without looking at test set scores, hyperparameter tuning, etc.  These splits are used in some of the other advanced tutorials, but omitted for simplicity here."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Loading Data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We load the YouTube comments dataset and create Pandas DataFrame objects for the train and test sets.\n",
+    "DataFrames are extremely popular in Python data analysis workloads, and Snorkel provides native support\n",
+    "for several DataFrame-like data structures, including Pandas, Dask, and PySpark.\n",
+    "For more information on working with Pandas DataFrames, see the [Pandas DataFrame guide](https://pandas.pydata.org/pandas-docs/stable/user_guide/dsintro.html).\n",
+    "\n",
+    "Each DataFrame consists of the following fields:\n",
+    "* **`author`**: Username of the comment author\n",
+    "* **`data`**: Date and time the comment was posted\n",
+    "* **`text`**: Raw text content of the comment\n",
+    "* **`label`**: Whether the comment is `SPAM` (1), `HAM` (0), or `UNKNOWN/ABSTAIN` (-1)\n",
+    "* **`video`**: Video the comment is associated with\n",
+    "\n",
+    "We start by loading our data.\n",
+    "The `load_spam_dataset()` method downloads the raw CSV files from the internet, divides them into splits, converts them into DataFrames, and shuffles them.\n",
+    "As mentioned above, the dataset contains comments from 5 of the most popular YouTube videos during a period between 2014 and 2015.\n",
+    "* The first four videos' comments are combined to form the `train` set. This set has no gold labels.\n",
+    "* The fifth video is part of the `test` set."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "This next cell takes care of some notebook-specific housekeeping.\n",
+    "You can ignore it."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "outputs": [],
+   "source": [
+    "%matplotlib inline\n",
+    "\n",
+    "import os\n",
+    "\n",
+    "# Make sure we're running from the spam/ directory\n",
+    "if os.path.basename(os.getcwd()) == \"snorkel-tutorials\":\n",
+    "    os.chdir(\"spam\")\n",
+    "\n",
+    "# Turn off TensorFlow logging messages\n",
+    "os.environ[\"TF_CPP_MIN_LOG_LEVEL\"] = \"3\"\n",
+    "\n",
+    "# For reproducibility\n",
+    "os.environ[\"PYTHONHASHSEED\"] = \"0\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "If you want to display all comment text untruncated, change `DISPLAY_ALL_TEXT` to `True` below."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "\n",
+    "\n",
+    "DISPLAY_ALL_TEXT = False\n",
+    "\n",
+    "pd.set_option(\"display.max_colwidth\", 0 if DISPLAY_ALL_TEXT else 50)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "This next cell makes sure a spaCy English model is downloaded.\n",
+    "If this is your first time downloading this model, restart the kernel after executing the next cell."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Defaulting to user installation because normal site-packages is not writeable\n",
+      "Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com\n",
+      "Collecting en_core_web_sm==2.3.1\n",
+      "  Downloading https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.3.1/en_core_web_sm-2.3.1.tar.gz (12.0 MB)\n",
+      "     |████████████████████████████████| 12.0 MB 1.7 MB/s            \n",
+      "\u001b[?25h  Preparing metadata (setup.py) ... \u001b[?25ldone\n",
+      "\u001b[?25hRequirement already satisfied: spacy<2.4.0,>=2.3.0 in /home/work/.local/lib/python3.8/site-packages (from en_core_web_sm==2.3.1) (2.3.7)\n",
+      "Requirement already satisfied: thinc<7.5.0,>=7.4.1 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (7.4.5)\n",
+      "Requirement already satisfied: numpy>=1.15.0 in /usr/local/lib/python3.8/dist-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.21.4)\n",
+      "Requirement already satisfied: catalogue<1.1.0,>=0.0.7 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.0.0)\n",
+      "Requirement already satisfied: requests<3.0.0,>=2.13.0 in /usr/local/lib/python3.8/dist-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (2.24.0)\n",
+      "Requirement already satisfied: cymem<2.1.0,>=2.0.2 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (2.0.6)\n",
+      "Requirement already satisfied: wasabi<1.1.0,>=0.4.0 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (0.9.0)\n",
+      "Requirement already satisfied: srsly<1.1.0,>=1.0.2 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.0.5)\n",
+      "Requirement already satisfied: setuptools in /usr/local/lib/python3.8/dist-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (58.5.3)\n",
+      "Requirement already satisfied: tqdm<5.0.0,>=4.38.0 in /usr/local/lib/python3.8/dist-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (4.59.0)\n",
+      "Requirement already satisfied: murmurhash<1.1.0,>=0.28.0 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.0.6)\n",
+      "Requirement already satisfied: blis<0.8.0,>=0.4.0 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (0.7.5)\n",
+      "Requirement already satisfied: plac<1.2.0,>=0.9.6 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.1.3)\n",
+      "Requirement already satisfied: preshed<3.1.0,>=3.0.2 in /home/work/.local/lib/python3.8/site-packages (from spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (3.0.6)\n",
+      "Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.8/dist-packages (from requests<3.0.0,>=2.13.0->spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (2021.5.30)\n",
+      "Requirement already satisfied: chardet<4,>=3.0.2 in /usr/local/lib/python3.8/dist-packages (from requests<3.0.0,>=2.13.0->spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (3.0.4)\n",
+      "Requirement already satisfied: urllib3!=1.25.0,!=1.25.1,<1.26,>=1.21.1 in /usr/local/lib/python3.8/dist-packages (from requests<3.0.0,>=2.13.0->spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (1.25.11)\n",
+      "Requirement already satisfied: idna<3,>=2.5 in /usr/local/lib/python3.8/dist-packages (from requests<3.0.0,>=2.13.0->spacy<2.4.0,>=2.3.0->en_core_web_sm==2.3.1) (2.10)\n",
+      "\u001b[33mWARNING: You are using pip version 21.3.1; however, version 22.0.3 is available.\n",
+      "You should consider upgrading via the '/usr/bin/python -m pip install --upgrade pip' command.\u001b[0m\n",
+      "\u001b[38;5;2m✔ Download and installation successful\u001b[0m\n",
+      "You can now load the model via spacy.load('en_core_web_sm')\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Download the spaCy english model\n",
+    "! python -m spacy download en_core_web_sm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {
+    "lines_to_next_cell": 2
+   },
+   "outputs": [],
+   "source": [
+    "from utils import load_spam_dataset\n",
+    "\n",
+    "df_train, df_test = load_spam_dataset()\n",
+    "\n",
+    "# We pull out the label vectors for ease of use later\n",
+    "Y_test = df_test.label.values"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The class distribution varies slightly between `SPAM` and `HAM`, but they're approximately class-balanced."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# For clarity, we define constants to represent the class labels for spam, ham, and abstaining.\n",
+    "ABSTAIN = -1\n",
+    "HAM = 0\n",
+    "SPAM = 1"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Writing Labeling Functions (LFs)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### A gentle introduction to LFs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Labeling functions (LFs) help users encode domain knowledge and other supervision sources programmatically.**\n",
+    "\n",
+    "LFs are heuristics that take as input a data point and either assign a label to it (in this case, `HAM` or `SPAM`) or abstain (don't assign any label). Labeling functions can be *noisy*: they don't have perfect accuracy and don't have to label every data point.\n",
+    "Moreover, different labeling functions can overlap (label the same data point) and even conflict (assign different labels to the same data point). This is expected, and we demonstrate how we deal with this later.\n",
+    "\n",
+    "Because their only requirement is that they map a data point a label (or abstain), they can wrap a wide variety of forms of supervision. Examples include, but are not limited to:\n",
+    "* *Keyword searches*: looking for specific words in a sentence\n",
+    "* *Pattern matching*: looking for specific syntactical patterns\n",
+    "* *Third-party models*: using an pre-trained model (usually a model for a different task than the one at hand)\n",
+    "* *Distant supervision*: using external knowledge base\n",
+    "* *Crowdworker labels*: treating each crowdworker as a black-box function that assigns labels to subsets of the data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Recommended practice for LF development"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Typical LF development cycles include multiple iterations of ideation, refining, evaluation, and debugging.\n",
+    "A typical cycle consists of the following steps:\n",
+    "\n",
+    "1. Look at examples to generate ideas for LFs\n",
+    "1. Write an initial version of an LF\n",
+    "1. Spot check its performance by looking at its output on data points in the training set (or development set if available)\n",
+    "1. Refine and debug to improve coverage or accuracy as necessary\n",
+    "\n",
+    "Our goal for LF development is to create a high quality set of training labels for our unlabeled dataset,\n",
+    "not to label everything or directly create a model for inference using the LFs.\n",
+    "The training labels are used to train a separate discriminative model (in this case, one which just uses the comment text) in order to generalize to new, unseen data points.\n",
+    "Using this model, we can make predictions for data points that our LFs don't cover.\n",
+    "\n",
+    "We'll walk through the development of two LFs using basic analysis tools in Snorkel, then provide a full set of LFs that we developed for this tutorial."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### a) Exploring the training set for initial ideas"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We'll start by looking at 20 random data points from the `train` set to generate some ideas for LFs."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>author</th>\n",
+       "      <th>text</th>\n",
+       "      <th>video</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>ambareesh nimkar</td>\n",
+       "      <td>\"eye of the tiger\" \"i am the champion\" seems l...</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>87</th>\n",
+       "      <td>pratik patel</td>\n",
+       "      <td>mindblowing dance.,.,.superbbb song﻿</td>\n",
+       "      <td>3</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>14</th>\n",
+       "      <td>RaMpAgE420</td>\n",
+       "      <td>Check out Berzerk video on my channel ! :D</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>80</th>\n",
+       "      <td>Jason Haddad</td>\n",
+       "      <td>Hey, check out my new website!! This site is a...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>104</th>\n",
+       "      <td>austin green</td>\n",
+       "      <td>Eminem is my insperasen and fav﻿</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>305</th>\n",
+       "      <td>M.E.S</td>\n",
+       "      <td>hey guys look im aware im spamming and it piss...</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>22</th>\n",
+       "      <td>John Monster</td>\n",
+       "      <td>Οh my god ... Roar is the most liked video at ...</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>338</th>\n",
+       "      <td>Alanoud Alsaleh</td>\n",
+       "      <td>I started hating Katy Perry after finding out ...</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>336</th>\n",
+       "      <td>Leonardo Baptista</td>\n",
+       "      <td>http://www.avaaz.org/po/petition/Youtube_Corpo...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>143</th>\n",
+       "      <td>UKz DoleSnacher</td>\n",
+       "      <td>Remove This video its wank﻿</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>163</th>\n",
+       "      <td>Monica Parker</td>\n",
+       "      <td>Check out this video on YouTube:﻿</td>\n",
+       "      <td>3</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>129</th>\n",
+       "      <td>b0b1t.48058475</td>\n",
+       "      <td>i rekt ur mum last nite. cuz da haterz were 2 ...</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>277</th>\n",
+       "      <td>MeSoHornyMeLuvULongTime</td>\n",
+       "      <td>This video is so racist!!! There are only anim...</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>265</th>\n",
+       "      <td>HarveyIsTheBoss</td>\n",
+       "      <td>You gotta say its funny. well not 2 billion wo...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>214</th>\n",
+       "      <td>janez novak</td>\n",
+       "      <td>share and like this page to win a hand signed ...</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>76</th>\n",
+       "      <td>Bizzle Sperq</td>\n",
+       "      <td>https://www.facebook.com/nicushorbboy add mee ...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>123</th>\n",
+       "      <td>Gaming and Stuff PRO</td>\n",
+       "      <td>Hello! Do you like gaming, art videos, scienti...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>268</th>\n",
+       "      <td>Young IncoVEVO</td>\n",
+       "      <td>Check out my Music Videos! and PLEASE SUBSCRIB...</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>433</th>\n",
+       "      <td>Chris Edgar</td>\n",
+       "      <td>Love the way you lie - Driveshaft﻿</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>40</th>\n",
+       "      <td>rap classics</td>\n",
+       "      <td>check out my channel for rap and hip hop music</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                      author  \\\n",
+       "4           ambareesh nimkar   \n",
+       "87              pratik patel   \n",
+       "14                RaMpAgE420   \n",
+       "80              Jason Haddad   \n",
+       "104             austin green   \n",
+       "305                    M.E.S   \n",
+       "22              John Monster   \n",
+       "338          Alanoud Alsaleh   \n",
+       "336        Leonardo Baptista   \n",
+       "143          UKz DoleSnacher   \n",
+       "163            Monica Parker   \n",
+       "129           b0b1t.48058475   \n",
+       "277  MeSoHornyMeLuvULongTime   \n",
+       "265          HarveyIsTheBoss   \n",
+       "214              janez novak   \n",
+       "76              Bizzle Sperq   \n",
+       "123     Gaming and Stuff PRO   \n",
+       "268           Young IncoVEVO   \n",
+       "433              Chris Edgar   \n",
+       "40              rap classics   \n",
+       "\n",
+       "                                                  text  video  \n",
+       "4    \"eye of the tiger\" \"i am the champion\" seems l...      2  \n",
+       "87                mindblowing dance.,.,.superbbb song﻿      3  \n",
+       "14          Check out Berzerk video on my channel ! :D      4  \n",
+       "80   Hey, check out my new website!! This site is a...      1  \n",
+       "104                   Eminem is my insperasen and fav﻿      4  \n",
+       "305  hey guys look im aware im spamming and it piss...      4  \n",
+       "22   Οh my god ... Roar is the most liked video at ...      2  \n",
+       "338  I started hating Katy Perry after finding out ...      2  \n",
+       "336  http://www.avaaz.org/po/petition/Youtube_Corpo...      1  \n",
+       "143                        Remove This video its wank﻿      1  \n",
+       "163                  Check out this video on YouTube:﻿      3  \n",
+       "129  i rekt ur mum last nite. cuz da haterz were 2 ...      2  \n",
+       "277  This video is so racist!!! There are only anim...      2  \n",
+       "265  You gotta say its funny. well not 2 billion wo...      1  \n",
+       "214  share and like this page to win a hand signed ...      4  \n",
+       "76   https://www.facebook.com/nicushorbboy add mee ...      1  \n",
+       "123  Hello! Do you like gaming, art videos, scienti...      1  \n",
+       "268  Check out my Music Videos! and PLEASE SUBSCRIB...      1  \n",
+       "433                 Love the way you lie - Driveshaft﻿      4  \n",
+       "40      check out my channel for rap and hip hop music      4  "
+      ]
+     },
+     "execution_count": 6,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "df_train[[\"author\", \"text\", \"video\"]].sample(20, random_state=2)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "One dominant pattern in the comments that look like spam (which we might know from prior domain experience, or from inspection of a few training data points) is the use of the phrase \"check out\" (e.g. \"check out my channel\").\n",
+    "Let's start with that."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### b) Writing an LF to identify spammy comments that use the phrase \"check out\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Labeling functions in Snorkel are created with the\n",
+    "[`@labeling_function` decorator](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.labeling_function.html).\n",
+    "The [decorator](https://realpython.com/primer-on-python-decorators/) can be applied to _any Python function_ that returns a label for a single data point.\n",
+    "\n",
+    "Let's start developing an LF to catch instances of commenters trying to get people to \"check out\" their channel, video, or website.\n",
+    "We'll start by just looking for the exact string `\"check out\"` in the text, and see how that compares to looking for just `\"check\"` in the text.\n",
+    "For the two versions of our rule, we'll write a Python function over a single data point that express it, then add the decorator."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling import labeling_function\n",
+    "\n",
+    "\n",
+    "@labeling_function()\n",
+    "def check(x):\n",
+    "    return SPAM if \"check\" in x.text.lower() else ABSTAIN\n",
+    "\n",
+    "\n",
+    "@labeling_function()\n",
+    "def check_out(x):\n",
+    "    return SPAM if \"check out\" in x.text.lower() else ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "To apply one or more LFs that we've written to a collection of data points, we use an\n",
+    "[`LFApplier`](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.LFApplier.html).\n",
+    "Because our data points are represented with a Pandas DataFrame in this tutorial, we use the\n",
+    "[`PandasLFApplier`](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.PandasLFApplier.html).\n",
+    "Correspondingly, a single data point `x` that's passed into our LFs will be a [Pandas `Series` object](https://pandas.pydata.org/pandas-docs/stable/reference/series.html).\n",
+    "\n",
+    "It's important to note that these LFs will work for any object with an attribute named `text`, not just Pandas objects.\n",
+    "Snorkel has several other appliers for different data point collection types which you can browse in the [API documentation](https://snorkel.readthedocs.io/en/master/packages/labeling.html).\n",
+    "\n",
+    "The output of the `apply(...)` method is a ***label matrix***, a fundamental concept in Snorkel.\n",
+    "It's a NumPy array `L` with one column for each LF and one row for each data point, where `L[i, j]` is the label that the `j`th labeling function output for the `i`th data point.\n",
+    "We'll create a label matrix for the `train` set."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 1586/1586 [00:00<00:00, 20870.98it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "from snorkel.labeling import PandasLFApplier\n",
+    "\n",
+    "lfs = [check_out, check]\n",
+    "\n",
+    "applier = PandasLFApplier(lfs=lfs)\n",
+    "L_train = applier.apply(df=df_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "array([[-1, -1],\n",
+       "       [-1, -1],\n",
+       "       [-1,  1],\n",
+       "       ...,\n",
+       "       [ 1,  1],\n",
+       "       [-1,  1],\n",
+       "       [ 1,  1]])"
+      ]
+     },
+     "execution_count": 9,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "L_train"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### c) Evaluate performance on training set"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We can easily calculate the coverage of these LFs (i.e., the percentage of the dataset that they label) as follows:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "check_out coverage: 21.4%\n",
+      "check coverage: 25.8%\n"
+     ]
+    }
+   ],
+   "source": [
+    "coverage_check_out, coverage_check = (L_train != ABSTAIN).mean(axis=0)\n",
+    "print(f\"check_out coverage: {coverage_check_out * 100:.1f}%\")\n",
+    "print(f\"check coverage: {coverage_check * 100:.1f}%\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Lots of statistics about labeling functions &mdash; like coverage &mdash; are useful when building any Snorkel application.\n",
+    "So Snorkel provides tooling for common LF analyses using the\n",
+    "[`LFAnalysis` utility](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.LFAnalysis.html).\n",
+    "We report the following summary statistics for multiple LFs at once:\n",
+    "\n",
+    "* **Polarity**: The set of unique labels this LF outputs (excluding abstains)\n",
+    "* **Coverage**: The fraction of the dataset the LF labels\n",
+    "* **Overlaps**: The fraction of the dataset where this LF and at least one other LF label\n",
+    "* **Conflicts**: The fraction of the dataset where this LF and at least one other LF label and disagree\n",
+    "* **Correct**: The number of data points this LF labels correctly (if gold labels are provided)\n",
+    "* **Incorrect**: The number of data points this LF labels incorrectly (if gold labels are provided)\n",
+    "* **Empirical Accuracy**: The empirical accuracy of this LF (if gold labels are provided)\n",
+    "\n",
+    "For *Correct*, *Incorrect*, and *Empirical Accuracy*, we don't want to penalize the LF for data points where it abstained.\n",
+    "We calculate these statistics only over those data points where the LF output a label.\n",
+    "**Note that in our current setup, we can't compute these statistics because we don't have any ground-truth labels (other than in the test set, which we cannot look at). Not to worry—Snorkel's `LabelModel` will estimate them without needing any ground-truth labels in the next step!**"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>j</th>\n",
+       "      <th>Polarity</th>\n",
+       "      <th>Coverage</th>\n",
+       "      <th>Overlaps</th>\n",
+       "      <th>Conflicts</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>check_out</th>\n",
+       "      <td>0</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.214376</td>\n",
+       "      <td>0.214376</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>check</th>\n",
+       "      <td>1</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.257881</td>\n",
+       "      <td>0.214376</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "           j Polarity  Coverage  Overlaps  Conflicts\n",
+       "check_out  0      [1]  0.214376  0.214376        0.0\n",
+       "check      1      [1]  0.257881  0.214376        0.0"
+      ]
+     },
+     "execution_count": 11,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "from snorkel.labeling import LFAnalysis\n",
+    "\n",
+    "LFAnalysis(L=L_train, lfs=lfs).lf_summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We might want to pick the `check` rule, since `check` has higher coverage. Let's take a look at 10 random `train` set data points where `check` labeled `SPAM` to see if it matches our intuition or if we can identify some false positives."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>author</th>\n",
+       "      <th>date</th>\n",
+       "      <th>text</th>\n",
+       "      <th>label</th>\n",
+       "      <th>video</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>305</th>\n",
+       "      <td>M.E.S</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>hey guys look im aware im spamming and it piss...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>265</th>\n",
+       "      <td>Kawiana Lewis</td>\n",
+       "      <td>2015-02-27T02:20:40.987000</td>\n",
+       "      <td>Check out this video on YouTube:opponents mm &lt;...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>3</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>89</th>\n",
+       "      <td>Stricker Stric</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>eminem new song check out my videos</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>147</th>\n",
+       "      <td>TheGenieBoy</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>check out fantasy music    right here -------&amp;...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>240</th>\n",
+       "      <td>Made2Falter</td>\n",
+       "      <td>2014-09-09T23:55:30</td>\n",
+       "      <td>Check out our vids, our songs are awesome! And...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>273</th>\n",
+       "      <td>Artady</td>\n",
+       "      <td>2014-08-11T16:27:55</td>\n",
+       "      <td>https://soundcloud.com/artady please check my ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>94</th>\n",
+       "      <td>Nick McGoldrick</td>\n",
+       "      <td>2014-10-27T13:19:06</td>\n",
+       "      <td>Check out my drum cover of E.T. here! thanks -...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>139</th>\n",
+       "      <td>MFkin PRXPHETZ</td>\n",
+       "      <td>2014-01-20T09:08:39</td>\n",
+       "      <td>if you like raw talent, raw lyrics, straight r...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>303</th>\n",
+       "      <td>이 정훈</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>This great Warning will happen soon. ,0\\nLneaD...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>246</th>\n",
+       "      <td>media.uploader</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>Check out my channel to see Rihanna short mix ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "              author                        date  \\\n",
+       "305            M.E.S                         NaN   \n",
+       "265    Kawiana Lewis  2015-02-27T02:20:40.987000   \n",
+       "89    Stricker Stric                         NaN   \n",
+       "147      TheGenieBoy                         NaN   \n",
+       "240      Made2Falter         2014-09-09T23:55:30   \n",
+       "273           Artady         2014-08-11T16:27:55   \n",
+       "94   Nick McGoldrick         2014-10-27T13:19:06   \n",
+       "139   MFkin PRXPHETZ         2014-01-20T09:08:39   \n",
+       "303             이 정훈                         NaN   \n",
+       "246   media.uploader                         NaN   \n",
+       "\n",
+       "                                                  text  label  video  \n",
+       "305  hey guys look im aware im spamming and it piss...   -1.0      4  \n",
+       "265  Check out this video on YouTube:opponents mm <...   -1.0      3  \n",
+       "89                 eminem new song check out my videos   -1.0      4  \n",
+       "147  check out fantasy music    right here -------&...   -1.0      4  \n",
+       "240  Check out our vids, our songs are awesome! And...   -1.0      2  \n",
+       "273  https://soundcloud.com/artady please check my ...   -1.0      2  \n",
+       "94   Check out my drum cover of E.T. here! thanks -...   -1.0      2  \n",
+       "139  if you like raw talent, raw lyrics, straight r...   -1.0      1  \n",
+       "303  This great Warning will happen soon. ,0\\nLneaD...   -1.0      4  \n",
+       "246  Check out my channel to see Rihanna short mix ...   -1.0      4  "
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "df_train.iloc[L_train[:, 1] == SPAM].sample(10, random_state=1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "No clear false positives here, but many look like they could be labeled by `check_out` as well.\n",
+    "\n",
+    "Let's see 10 data points where `check_out` abstained, but `check` labeled. We can use the`get_label_buckets(...)` to group data points by their predicted label and/or true labels."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>author</th>\n",
+       "      <th>date</th>\n",
+       "      <th>text</th>\n",
+       "      <th>label</th>\n",
+       "      <th>video</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>403</th>\n",
+       "      <td>ownpear902</td>\n",
+       "      <td>2014-07-22T18:44:36.299000</td>\n",
+       "      <td>check it out free stuff for watching videos an...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>3</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>256</th>\n",
+       "      <td>PacKmaN</td>\n",
+       "      <td>2014-11-05T21:56:39</td>\n",
+       "      <td>check men out i put allot of effort into my mu...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>196</th>\n",
+       "      <td>Angek95</td>\n",
+       "      <td>2014-11-03T22:28:56</td>\n",
+       "      <td>Check my channel, please!﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>282</th>\n",
+       "      <td>CronicleFPS</td>\n",
+       "      <td>2014-11-06T03:10:26</td>\n",
+       "      <td>Check me out I'm all about gaming ﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>352</th>\n",
+       "      <td>MrJtill0317</td>\n",
+       "      <td>NaN</td>\n",
+       "      <td>┏━━━┓┏┓╋┏┓┏━━━┓┏━━━┓┏┓╋╋┏┓  ┃┏━┓┃┃┃╋┃┃┃┏━┓┃┗┓┏...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>161</th>\n",
+       "      <td>MarianMusicChannel</td>\n",
+       "      <td>2014-08-24T03:57:52</td>\n",
+       "      <td>Hello! I'm Marian, I'm a singer from Venezuela...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>270</th>\n",
+       "      <td>Kyle Jaber</td>\n",
+       "      <td>2014-01-19T00:21:29</td>\n",
+       "      <td>Check me out! I'm kyle. I rap so yeah ﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>292</th>\n",
+       "      <td>Soundhase</td>\n",
+       "      <td>2014-08-19T18:59:38</td>\n",
+       "      <td>Hi Guys! check this awesome EDM &amp;amp; House mi...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>179</th>\n",
+       "      <td>Nerdy Peach</td>\n",
+       "      <td>2014-10-29T22:44:41</td>\n",
+       "      <td>Hey! I'm NERDY PEACH and I'm a new youtuber an...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>16</th>\n",
+       "      <td>zhichao wang</td>\n",
+       "      <td>2013-11-29T02:13:56</td>\n",
+       "      <td>i think about 100 millions of the views come f...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 author                        date  \\\n",
+       "403          ownpear902  2014-07-22T18:44:36.299000   \n",
+       "256             PacKmaN         2014-11-05T21:56:39   \n",
+       "196             Angek95         2014-11-03T22:28:56   \n",
+       "282         CronicleFPS         2014-11-06T03:10:26   \n",
+       "352         MrJtill0317                         NaN   \n",
+       "161  MarianMusicChannel         2014-08-24T03:57:52   \n",
+       "270          Kyle Jaber         2014-01-19T00:21:29   \n",
+       "292           Soundhase         2014-08-19T18:59:38   \n",
+       "179         Nerdy Peach         2014-10-29T22:44:41   \n",
+       "16         zhichao wang         2013-11-29T02:13:56   \n",
+       "\n",
+       "                                                  text  label  video  \n",
+       "403  check it out free stuff for watching videos an...   -1.0      3  \n",
+       "256  check men out i put allot of effort into my mu...   -1.0      1  \n",
+       "196                         Check my channel, please!﻿   -1.0      1  \n",
+       "282                Check me out I'm all about gaming ﻿   -1.0      1  \n",
+       "352  ┏━━━┓┏┓╋┏┓┏━━━┓┏━━━┓┏┓╋╋┏┓  ┃┏━┓┃┃┃╋┃┃┃┏━┓┃┗┓┏...   -1.0      4  \n",
+       "161  Hello! I'm Marian, I'm a singer from Venezuela...   -1.0      2  \n",
+       "270            Check me out! I'm kyle. I rap so yeah ﻿   -1.0      1  \n",
+       "292  Hi Guys! check this awesome EDM &amp; House mi...   -1.0      2  \n",
+       "179  Hey! I'm NERDY PEACH and I'm a new youtuber an...   -1.0      2  \n",
+       "16   i think about 100 millions of the views come f...   -1.0      1  "
+      ]
+     },
+     "execution_count": 13,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "from snorkel.analysis import get_label_buckets\n",
+    "\n",
+    "buckets = get_label_buckets(L_train[:, 0], L_train[:, 1])\n",
+    "df_train.iloc[buckets[(ABSTAIN, SPAM)]].sample(10, random_state=1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Most of these seem like small modifications of \"check out\", like \"check me out\" or \"check it out\".\n",
+    "Can we get the best of both worlds?"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### d) Balance accuracy and coverage"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let's see if we can use regular expressions to account for modifications of \"check out\" and get the coverage of `check` plus the accuracy of `check_out`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import re\n",
+    "\n",
+    "\n",
+    "@labeling_function()\n",
+    "def regex_check_out(x):\n",
+    "    return SPAM if re.search(r\"check.*out\", x.text, flags=re.I) else ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Again, let's generate our label matrices and see how we do."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 1586/1586 [00:00<00:00, 15071.46it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "lfs = [check_out, check, regex_check_out]\n",
+    "\n",
+    "applier = PandasLFApplier(lfs=lfs)\n",
+    "L_train = applier.apply(df=df_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>j</th>\n",
+       "      <th>Polarity</th>\n",
+       "      <th>Coverage</th>\n",
+       "      <th>Overlaps</th>\n",
+       "      <th>Conflicts</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>check_out</th>\n",
+       "      <td>0</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.214376</td>\n",
+       "      <td>0.214376</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>check</th>\n",
+       "      <td>1</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.257881</td>\n",
+       "      <td>0.233922</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>regex_check_out</th>\n",
+       "      <td>2</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.233922</td>\n",
+       "      <td>0.233922</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 j Polarity  Coverage  Overlaps  Conflicts\n",
+       "check_out        0      [1]  0.214376  0.214376        0.0\n",
+       "check            1      [1]  0.257881  0.233922        0.0\n",
+       "regex_check_out  2      [1]  0.233922  0.233922        0.0"
+      ]
+     },
+     "execution_count": 16,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "LFAnalysis(L=L_train, lfs=lfs).lf_summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We've split the difference in `train` set coverage—this looks promising!\n",
+    "Let's verify that we corrected our false positive from before."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "To understand the coverage difference between `check` and `regex_check_out`, let's take a look at 10 data points from the `train` set.\n",
+    "Remember: coverage isn't always good.\n",
+    "Adding false positives will increase coverage."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>author</th>\n",
+       "      <th>date</th>\n",
+       "      <th>text</th>\n",
+       "      <th>label</th>\n",
+       "      <th>video</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>16</th>\n",
+       "      <td>zhichao wang</td>\n",
+       "      <td>2013-11-29T02:13:56</td>\n",
+       "      <td>i think about 100 millions of the views come f...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>99</th>\n",
+       "      <td>Santeri Saariokari</td>\n",
+       "      <td>2014-09-03T16:32:59</td>\n",
+       "      <td>Hey guys go to check my video name \"growtopia ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>21</th>\n",
+       "      <td>BeBe Burkey</td>\n",
+       "      <td>2013-11-28T16:30:13</td>\n",
+       "      <td>and u should.d check my channel and tell me wh...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>239</th>\n",
+       "      <td>Cony</td>\n",
+       "      <td>2013-11-28T16:01:47</td>\n",
+       "      <td>You should check my channel for Funny VIDEOS!!﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>288</th>\n",
+       "      <td>Kochos</td>\n",
+       "      <td>2014-01-20T17:08:37</td>\n",
+       "      <td>i check back often to help reach 2x10^9 views ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>65</th>\n",
+       "      <td>by.Ovskiy</td>\n",
+       "      <td>2014-10-13T17:09:46</td>\n",
+       "      <td>Rap from Belarus, check my channel:)﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>196</th>\n",
+       "      <td>Angek95</td>\n",
+       "      <td>2014-11-03T22:28:56</td>\n",
+       "      <td>Check my channel, please!﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>333</th>\n",
+       "      <td>FreexGaming</td>\n",
+       "      <td>2014-10-18T08:12:26</td>\n",
+       "      <td>want to win borderlands the pre-sequel? check ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>167</th>\n",
+       "      <td>Brandon Pryor</td>\n",
+       "      <td>2014-01-19T00:36:25</td>\n",
+       "      <td>I dont even watch it anymore i just come here ...</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>266</th>\n",
+       "      <td>Zielimeek21</td>\n",
+       "      <td>2013-11-28T21:49:00</td>\n",
+       "      <td>I'm only checking the views﻿</td>\n",
+       "      <td>-1.0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 author                 date  \\\n",
+       "16         zhichao wang  2013-11-29T02:13:56   \n",
+       "99   Santeri Saariokari  2014-09-03T16:32:59   \n",
+       "21          BeBe Burkey  2013-11-28T16:30:13   \n",
+       "239                Cony  2013-11-28T16:01:47   \n",
+       "288              Kochos  2014-01-20T17:08:37   \n",
+       "65            by.Ovskiy  2014-10-13T17:09:46   \n",
+       "196             Angek95  2014-11-03T22:28:56   \n",
+       "333         FreexGaming  2014-10-18T08:12:26   \n",
+       "167       Brandon Pryor  2014-01-19T00:36:25   \n",
+       "266         Zielimeek21  2013-11-28T21:49:00   \n",
+       "\n",
+       "                                                  text  label  video  \n",
+       "16   i think about 100 millions of the views come f...   -1.0      1  \n",
+       "99   Hey guys go to check my video name \"growtopia ...   -1.0      2  \n",
+       "21   and u should.d check my channel and tell me wh...   -1.0      1  \n",
+       "239    You should check my channel for Funny VIDEOS!!﻿   -1.0      1  \n",
+       "288  i check back often to help reach 2x10^9 views ...   -1.0      1  \n",
+       "65               Rap from Belarus, check my channel:)﻿   -1.0      2  \n",
+       "196                         Check my channel, please!﻿   -1.0      1  \n",
+       "333  want to win borderlands the pre-sequel? check ...   -1.0      2  \n",
+       "167  I dont even watch it anymore i just come here ...   -1.0      1  \n",
+       "266                       I'm only checking the views﻿   -1.0      1  "
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "buckets = get_label_buckets(L_train[:, 1], L_train[:, 2])\n",
+    "df_train.iloc[buckets[(SPAM, ABSTAIN)]].sample(10, random_state=1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Most of these are SPAM, but a good number are false positives.\n",
+    "**To keep precision high (while not sacrificing much in terms of coverage), we'd choose our regex-based rule.**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### e) Writing an LF that uses a third-party model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The LF interface is extremely flexible, and can wrap existing models.\n",
+    "A common technique is to use a commodity model trained for other tasks that are related to, but not the same as, the one we care about.\n",
+    "\n",
+    "For example, the [TextBlob](https://textblob.readthedocs.io/en/dev/index.html) tool provides a pretrained sentiment analyzer. Our spam classification task is not the same as sentiment classification, but we may believe that `SPAM` and `HAM` comments have different distributions of sentiment scores.\n",
+    "We'll focus on writing LFs for `HAM`, since we identified `SPAM` comments above.\n",
+    "\n",
+    "**A brief intro to `Preprocessor`s**\n",
+    "\n",
+    "A [Snorkel `Preprocessor`](https://snorkel.readthedocs.io/en/master/packages/_autosummary/preprocess/snorkel.preprocess.Preprocessor.html#snorkel.preprocess.Preprocessor)\n",
+    "is constructed from a black-box Python function that maps a data point to a new data point.\n",
+    "`LabelingFunction`s can use `Preprocessor`s, which lets us write LFs over transformed or enhanced data points.\n",
+    "We add the [`@preprocessor(...)` decorator](https://snorkel.readthedocs.io/en/master/packages/_autosummary/preprocess/snorkel.preprocess.preprocessor.html)\n",
+    "to preprocessing functions to create `Preprocessor`s.\n",
+    "`Preprocessor`s also have extra functionality, such as memoization\n",
+    "(i.e. input/output caching, so it doesn't re-execute for each LF that uses it).\n",
+    "\n",
+    "We'll start by creating a `Preprocessor` that runs `TextBlob` on our comments, then extracts the polarity and subjectivity scores."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Defaulting to user installation because normal site-packages is not writeable\n",
+      "Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com\n",
+      "Collecting textblob\n",
+      "  Downloading textblob-0.17.1-py2.py3-none-any.whl (636 kB)\n",
+      "     |████████████████████████████████| 636 kB 14.7 MB/s            \n",
+      "\u001b[?25hRequirement already satisfied: nltk>=3.1 in /usr/local/lib/python3.8/dist-packages (from textblob) (3.6.2)\n",
+      "Requirement already satisfied: click in /usr/local/lib/python3.8/dist-packages (from nltk>=3.1->textblob) (7.1.2)\n",
+      "Requirement already satisfied: tqdm in /usr/local/lib/python3.8/dist-packages (from nltk>=3.1->textblob) (4.59.0)\n",
+      "Requirement already satisfied: regex in /usr/local/lib/python3.8/dist-packages (from nltk>=3.1->textblob) (2020.2.20)\n",
+      "Requirement already satisfied: joblib in /usr/local/lib/python3.8/dist-packages (from nltk>=3.1->textblob) (0.14.0)\n",
+      "Installing collected packages: textblob\n",
+      "Successfully installed textblob-0.17.1\n",
+      "\u001b[33mWARNING: You are using pip version 21.3.1; however, version 22.0.3 is available.\n",
+      "You should consider upgrading via the '/usr/bin/python3 -m pip install --upgrade pip' command.\u001b[0m\n"
+     ]
+    }
+   ],
+   "source": [
+    "# !pip install textblob"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.preprocess import preprocessor\n",
+    "from textblob import TextBlob\n",
+    "\n",
+    "\n",
+    "@preprocessor(memoize=True)\n",
+    "def textblob_sentiment(x):\n",
+    "    scores = TextBlob(x.text)\n",
+    "    x.polarity = scores.sentiment.polarity\n",
+    "    x.subjectivity = scores.sentiment.subjectivity\n",
+    "    return x"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We can now pick a reasonable threshold and write a corresponding labeling function (note that it doesn't have to be perfect as the `LabelModel` will soon help us estimate each labeling function's accuracy and reweight their outputs accordingly):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@labeling_function(pre=[textblob_sentiment])\n",
+    "def textblob_polarity(x):\n",
+    "    return HAM if x.polarity > 0.9 else ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let's do the same for the subjectivity scores.\n",
+    "This will run faster than the last cell, since we memoized the `Preprocessor` outputs."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@labeling_function(pre=[textblob_sentiment])\n",
+    "def textblob_subjectivity(x):\n",
+    "    return HAM if x.subjectivity >= 0.5 else ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let's apply our LFs so we can analyze their performance."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 1586/1586 [00:01<00:00, 984.28it/s] \n"
+     ]
+    }
+   ],
+   "source": [
+    "lfs = [textblob_polarity, textblob_subjectivity]\n",
+    "\n",
+    "applier = PandasLFApplier(lfs)\n",
+    "L_train = applier.apply(df_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>j</th>\n",
+       "      <th>Polarity</th>\n",
+       "      <th>Coverage</th>\n",
+       "      <th>Overlaps</th>\n",
+       "      <th>Conflicts</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>textblob_polarity</th>\n",
+       "      <td>0</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.035309</td>\n",
+       "      <td>0.013871</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>textblob_subjectivity</th>\n",
+       "      <td>1</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.357503</td>\n",
+       "      <td>0.013871</td>\n",
+       "      <td>0.0</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                       j Polarity  Coverage  Overlaps  Conflicts\n",
+       "textblob_polarity      0      [0]  0.035309  0.013871        0.0\n",
+       "textblob_subjectivity  1      [0]  0.357503  0.013871        0.0"
+      ]
+     },
+     "execution_count": 24,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "LFAnalysis(L_train, lfs).lf_summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Again, these LFs aren't perfect—note that the `textblob_subjectivity` LF has fairly high coverage and could have a high rate of false positives. We'll rely on Snorkel's `LabelModel` to estimate the labeling function accuracies and reweight and combine their outputs accordingly.**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Writing More Labeling Functions"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "If a single LF had high enough coverage to label our entire test dataset accurately, then we wouldn't need a classifier at all.\n",
+    "We could just use that single simple heuristic to complete the task.\n",
+    "But most problems are not that simple.\n",
+    "Instead, we usually need to **combine multiple LFs** to label our dataset, both to increase the size of the generated training set (since we can't generate training labels for data points that no LF voted on) and to improve the overall accuracy of the training labels we generate by factoring in multiple different signals.\n",
+    "\n",
+    "In the following sections, we'll show just a few of the many types of LFs that you could write to generate a training dataset for this problem."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### a) Keyword LFs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For text applications, some of the simplest LFs to write are often just keyword lookups.\n",
+    "These will often follow the same execution pattern, so we can create a template and use the `resources` parameter to pass in LF-specific keywords.\n",
+    "Similar to the [`labeling_function` decorator](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.labeling_function.html#snorkel.labeling.labeling_function),\n",
+    "the [`LabelingFunction` class](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.LabelingFunction.html#snorkel.labeling.LabelingFunction)\n",
+    "wraps a Python function (the `f` parameter), and we can use the `resources` parameter to pass in keyword arguments (here, our keywords to lookup) to said function."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling import LabelingFunction\n",
+    "\n",
+    "\n",
+    "def keyword_lookup(x, keywords, label):\n",
+    "    if any(word in x.text.lower() for word in keywords):\n",
+    "        return label\n",
+    "    return ABSTAIN\n",
+    "\n",
+    "\n",
+    "def make_keyword_lf(keywords, label=SPAM):\n",
+    "    return LabelingFunction(\n",
+    "        name=f\"keyword_{keywords[0]}\",\n",
+    "        f=keyword_lookup,\n",
+    "        resources=dict(keywords=keywords, label=label),\n",
+    "    )\n",
+    "\n",
+    "\n",
+    "\"\"\"Spam comments talk about 'my channel', 'my video', etc.\"\"\"\n",
+    "keyword_my = make_keyword_lf(keywords=[\"my\"])\n",
+    "\n",
+    "\"\"\"Spam comments ask users to subscribe to their channels.\"\"\"\n",
+    "keyword_subscribe = make_keyword_lf(keywords=[\"subscribe\"])\n",
+    "\n",
+    "\"\"\"Spam comments post links to other channels.\"\"\"\n",
+    "keyword_link = make_keyword_lf(keywords=[\"http\"])\n",
+    "\n",
+    "\"\"\"Spam comments make requests rather than commenting.\"\"\"\n",
+    "keyword_please = make_keyword_lf(keywords=[\"please\", \"plz\"])\n",
+    "\n",
+    "\"\"\"Ham comments actually talk about the video's content.\"\"\"\n",
+    "keyword_song = make_keyword_lf(keywords=[\"song\"], label=HAM)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### b) Pattern-matching LFs (regular expressions)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "If we want a little more control over a keyword search, we can look for regular expressions instead.\n",
+    "The LF we developed above (`regex_check_out`) is an example of this."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### c)  Heuristic LFs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "There may other heuristics or \"rules of thumb\" that you come up with as you look at the data.\n",
+    "So long as you can express it in a function, it's a viable LF!"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@labeling_function()\n",
+    "def short_comment(x):\n",
+    "    \"\"\"Ham comments are often short, such as 'cool video!'\"\"\"\n",
+    "    return HAM if len(x.text.split()) < 5 else ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### d) LFs with Complex Preprocessors"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Some LFs rely on fields that aren't present in the raw data, but can be derived from it.\n",
+    "We can enrich our data (providing more fields for the LFs to refer to) using `Preprocessor`s.\n",
+    "\n",
+    "For example, we can use the fantastic NLP (natural language processing) tool [spaCy](https://spacy.io/) to add lemmas, part-of-speech (pos) tags, etc. to each token.\n",
+    "Snorkel provides a prebuilt preprocessor for spaCy called `SpacyPreprocessor` which adds a new field to the\n",
+    "data point containing a [spaCy `Doc` object](https://spacy.io/api/doc).\n",
+    "For more info, see the [`SpacyPreprocessor` documentation](https://snorkel.readthedocs.io/en/master/packages/_autosummary/preprocess/snorkel.preprocess.nlp.SpacyPreprocessor.html#snorkel.preprocess.nlp.SpacyPreprocessor).\n",
+    "\n",
+    "\n",
+    "If you prefer to use a different NLP tool, you can also wrap that as a `Preprocessor` and use it in the same way.\n",
+    "For more info, see the [`preprocessor` documentation](https://snorkel.readthedocs.io/en/master/packages/_autosummary/preprocess/snorkel.preprocess.preprocessor.html#snorkel.preprocess.preprocessor)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "If the spaCy English model wasn't already installed, the next cell may raise an exception.\n",
+    "If this happens, restart the kernel and re-execute the cells up to this point."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.preprocess.nlp import SpacyPreprocessor\n",
+    "\n",
+    "# The SpacyPreprocessor parses the text in text_field and\n",
+    "# stores the new enriched representation in doc_field\n",
+    "spacy = SpacyPreprocessor(text_field=\"text\", doc_field=\"doc\", memoize=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@labeling_function(pre=[spacy])\n",
+    "def has_person(x):\n",
+    "    \"\"\"Ham comments mention specific people and are short.\"\"\"\n",
+    "    if len(x.doc) < 20 and any([ent.label_ == \"PERSON\" for ent in x.doc.ents]):\n",
+    "        return HAM\n",
+    "    else:\n",
+    "        return ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Because spaCy is such a common preprocessor for NLP applications, we also provide a\n",
+    "[prebuilt `labeling_function`-like decorator that uses spaCy](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.lf.nlp.nlp_labeling_function.html#snorkel.labeling.lf.nlp.nlp_labeling_function).\n",
+    "This resulting LF is identical to the one defined manually above."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling.lf.nlp import nlp_labeling_function\n",
+    "\n",
+    "\n",
+    "@nlp_labeling_function()\n",
+    "def has_person_nlp(x):\n",
+    "    \"\"\"Ham comments mention specific people and are short.\"\"\"\n",
+    "    if len(x.doc) < 20 and any([ent.label_ == \"PERSON\" for ent in x.doc.ents]):\n",
+    "        return HAM\n",
+    "    else:\n",
+    "        return ABSTAIN"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Adding new domain-specific preprocessors and LF types is a great way to contribute to Snorkel!\n",
+    "If you have an idea, feel free to reach out to the maintainers or submit a PR!**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### e) Third-party Model LFs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We can also utilize other models, including ones trained for other tasks that are related to, but not the same as, the one we care about.\n",
+    "The TextBlob-based LFs we created above are great examples of this!"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Combining Labeling Function Outputs with the Label Model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "This tutorial demonstrates just a handful of the types of LFs that one might write for this task.\n",
+    "One of the key goals of Snorkel is _not_ to replace the effort, creativity, and subject matter expertise required to come up with these labeling functions, but rather to make it faster to write them, since **in Snorkel the labeling functions are assumed to be noisy, i.e. innaccurate, overlapping, etc.**\n",
+    "Said another way: the LF abstraction provides a flexible interface for conveying a huge variety of supervision signals, and the `LabelModel` is able to denoise these signals, reducing the need for painstaking manual fine-tuning."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "lfs = [\n",
+    "    keyword_my,\n",
+    "    keyword_subscribe,\n",
+    "    keyword_link,\n",
+    "    keyword_please,\n",
+    "    keyword_song,\n",
+    "    regex_check_out,\n",
+    "    short_comment,\n",
+    "    has_person_nlp,\n",
+    "    textblob_polarity,\n",
+    "    textblob_subjectivity,\n",
+    "]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "With our full set of LFs, we can now apply these once again with `LFApplier` to get the label matrices.\n",
+    "The Pandas format provides an easy interface that many practitioners are familiar with, but it is also less optimized for scale.\n",
+    "For larger datasets, more compute-intensive LFs, or larger LF sets, you may decide to use one of the other data formats\n",
+    "that Snorkel supports natively, such as Dask DataFrames or PySpark DataFrames, and their corresponding applier objects.\n",
+    "For more info, check out the [Snorkel API documentation](https://snorkel.readthedocs.io/en/master/packages/labeling.html)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 1586/1586 [00:14<00:00, 108.43it/s]\n",
+      "100%|██████████| 250/250 [00:02<00:00, 90.94it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "applier = PandasLFApplier(lfs=lfs)\n",
+    "L_train = applier.apply(df=df_train)\n",
+    "L_test = applier.apply(df=df_test)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>j</th>\n",
+       "      <th>Polarity</th>\n",
+       "      <th>Coverage</th>\n",
+       "      <th>Overlaps</th>\n",
+       "      <th>Conflicts</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>keyword_my</th>\n",
+       "      <td>0</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.198613</td>\n",
+       "      <td>0.188525</td>\n",
+       "      <td>0.115385</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>keyword_subscribe</th>\n",
+       "      <td>1</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.127364</td>\n",
+       "      <td>0.107188</td>\n",
+       "      <td>0.067465</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>keyword_http</th>\n",
+       "      <td>2</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.119168</td>\n",
+       "      <td>0.102774</td>\n",
+       "      <td>0.083859</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>keyword_please</th>\n",
+       "      <td>3</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.112232</td>\n",
+       "      <td>0.109710</td>\n",
+       "      <td>0.057377</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>keyword_song</th>\n",
+       "      <td>4</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.141866</td>\n",
+       "      <td>0.110971</td>\n",
+       "      <td>0.043506</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>regex_check_out</th>\n",
+       "      <td>5</td>\n",
+       "      <td>[1]</td>\n",
+       "      <td>0.233922</td>\n",
+       "      <td>0.129256</td>\n",
+       "      <td>0.085750</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>short_comment</th>\n",
+       "      <td>6</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.225725</td>\n",
+       "      <td>0.145019</td>\n",
+       "      <td>0.074401</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>has_person_nlp</th>\n",
+       "      <td>7</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.076293</td>\n",
+       "      <td>0.059899</td>\n",
+       "      <td>0.028373</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>textblob_polarity</th>\n",
+       "      <td>8</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.035309</td>\n",
+       "      <td>0.032156</td>\n",
+       "      <td>0.005044</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>textblob_subjectivity</th>\n",
+       "      <td>9</td>\n",
+       "      <td>[0]</td>\n",
+       "      <td>0.357503</td>\n",
+       "      <td>0.256620</td>\n",
+       "      <td>0.160151</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                       j Polarity  Coverage  Overlaps  Conflicts\n",
+       "keyword_my             0      [1]  0.198613  0.188525   0.115385\n",
+       "keyword_subscribe      1      [1]  0.127364  0.107188   0.067465\n",
+       "keyword_http           2      [1]  0.119168  0.102774   0.083859\n",
+       "keyword_please         3      [1]  0.112232  0.109710   0.057377\n",
+       "keyword_song           4      [0]  0.141866  0.110971   0.043506\n",
+       "regex_check_out        5      [1]  0.233922  0.129256   0.085750\n",
+       "short_comment          6      [0]  0.225725  0.145019   0.074401\n",
+       "has_person_nlp         7      [0]  0.076293  0.059899   0.028373\n",
+       "textblob_polarity      8      [0]  0.035309  0.032156   0.005044\n",
+       "textblob_subjectivity  9      [0]  0.357503  0.256620   0.160151"
+      ]
+     },
+     "execution_count": 32,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "LFAnalysis(L=L_train, lfs=lfs).lf_summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "We see that our labeling functions vary in coverage, how much they overlap/conflict with one another, and almost certainly their accuracies as well.\n",
+    "We can view a histogram of how many LF labels the data points in our train set have to get an idea of our total coverage."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "outputs": [
+    {
+     "data": {
+      "image/png": "iVBORw0KGgoAAAANSUhEUgAAAYgAAAEICAYAAABF82P+AAAAOXRFWHRTb2Z0d2FyZQBNYXRwbG90bGliIHZlcnNpb24zLjQuMiwgaHR0cHM6Ly9tYXRwbG90bGliLm9yZy8rg+JYAAAACXBIWXMAAAsTAAALEwEAmpwYAAAas0lEQVR4nO3de5RedX3v8feHYMBbEMucdRYJMUHjJV64jfHCEVFu8dAmrBZrONIick6KhyhKbQ2nLuyJq+sAHq0WYzFi9GjVlIuXaUmNVoHWFiQTQDDB1CFGkoglEgqKCAz5nD/2Ht15smeyE2bPM5n5vNZ6Vvb+7f3bz3eeBfOZvX/P/m3ZJiIiotMB3S4gIiLGpwRERETUSkBEREStBERERNRKQERERK0ERERE1Go1ICTNl7RR0oCkpSPs93uSLKm30nZx2W+jpNParDMiInZ3YFsHljQFWA6cAmwF1krqs72hY79nAxcC3620zQUWAS8FDgf+UdILbT853PsddthhnjVr1qj/HBERE9m6det+ZrunbltrAQHMAwZsbwKQtApYCGzo2O+DwGXAn1TaFgKrbD8G/EjSQHm8m4d7s1mzZtHf3z+K5UdETHySfjzctjYvMU0HtlTWt5ZtvybpWOAI29fvbd+IiGhX1wapJR0AfAT446dwjMWS+iX1b9++ffSKi4iIVgNiG3BEZX1G2Tbk2cDLgBslbQZeDfSVA9V76guA7RW2e2339vTUXkKLiIh91GZArAXmSJotaSrFoHPf0EbbD9k+zPYs27OAW4AFtvvL/RZJOkjSbGAOcGuLtUZERIfWBqltD0paAqwBpgArba+XtAzot903Qt/1kq6mGNAeBC4Y6RtMEREx+jRRpvvu7e11vsUUEbF3JK2z3Vu3LXdSR0RErQRERETUSkBEREStNu+kjr00a2nn/YLdsfnS07tdQkSMAzmDiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIio1WpASJovaaOkAUlLa7afL+kuSXdI+o6kuWX7LEmPlu13SLqyzTojImJ3rT0PQtIUYDlwCrAVWCupz/aGym5ftH1luf8C4CPA/HLbPbaPbqu+iIgYWZtnEPOAAdubbD8OrAIWVnew/XBl9ZmAW6wnIiL2QpsBMR3YUlnfWrbtQtIFku4BLgfeVdk0W9Ltkm6S9LoW64yIiBpdH6S2vdz284H3Ae8vm+8DZto+BrgI+KKkaZ19JS2W1C+pf/v27WNXdETEJNBmQGwDjqiszyjbhrMKOAPA9mO2HyiX1wH3AC/s7GB7he1e2709PT2jVXdERNBuQKwF5kiaLWkqsAjoq+4gaU5l9XTgh2V7TznIjaQjgTnAphZrjYiIDq19i8n2oKQlwBpgCrDS9npJy4B+233AEkknA08ADwLnlN1PAJZJegLYCZxve0dbtUZExO5aCwgA26uB1R1tl1SWLxym33XAdW3WFhERI+v6IHVERIxPCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIio1WpASJovaaOkAUlLa7afL+kuSXdI+o6kuZVtF5f9Nko6rc06IyJid60FhKQpwHLgTcBc4KxqAJS+aPvlto8GLgc+UvadCywCXgrMBz5RHi8iIsZIm2cQ84AB25tsPw6sAhZWd7D9cGX1mYDL5YXAKtuP2f4RMFAeLyIixsiBLR57OrClsr4VeFXnTpIuAC4CpgJvrPS9paPv9HbKjIiIOl0fpLa93PbzgfcB79+bvpIWS+qX1L99+/Z2CoyImKTaDIhtwBGV9Rll23BWAWfsTV/bK2z32u7t6el5atVGRMQu2gyItcAcSbMlTaUYdO6r7iBpTmX1dOCH5XIfsEjSQZJmA3OAW1usNSIiOrQ2BmF7UNISYA0wBVhpe72kZUC/7T5giaSTgSeAB4Fzyr7rJV0NbAAGgQtsP9lWrRERsbs2B6mxvRpY3dF2SWX5whH6/gXwF+1VFxERI+n6IHVERIxPewwIScc3aYuIiImlyRnEFQ3bIiJiAhl2DELSa4DXAj2SLqpsmkYx6BwT1Kyl13e7BAA2X3p6t0uImNRGGqSeCjyr3OfZlfaHgTPbLCoiIrpv2ICwfRNwk6TP2v6xpGfY/uUY1hYREV3UZAzicEkbgB8ASDpK0ifaLSsiIrqtSUB8FDgNeADA9veAE1qsKSIixoFG90HY3tLRlLuaIyImuCZ3Um+R9FrAkp4GXAjc3W5ZERHRbU3OIM4HLqB4HsM24OhyPSIiJrA9nkHY/hnw1jGoJSIixpEmU21cLmmapKdJ+pak7ZLOHoviIiKie5pcYjq1fHb0bwObgRcAf9JmURER0X1NAmLoMtTpwDW2H2qxnoiIGCeafIvp7yX9AHgUeIekHuBX7ZYVERHdtsczCNtLKSbt67X9BPAIsLDtwiIioruaPlHucOBkSQdX2j7XQj0RETFONPkW0wconv9wBfAG4HJgQZODS5ovaaOkAUlLa7ZfJGmDpDvLb0g9r7LtSUl3lK++xj9RRESMiiaD1GcCJwE/tX0ucBRwyJ46SZoCLAfeBMwFzpI0t2O32ykuXb0CuJYifIY8avvo8tUokCIiYvQ0CYhHbe8EBiVNA+4HjmjQbx4wYHuT7ceBVXSMXdi+oTKF+C3AjOalR0REm5oERL+k5wCfAtYBtwE3N+g3HahO8re1bBvOecA/VNYPltQv6RZJZzR4v4iIGEVNptr4n+XilZK+DkyzfedoFlHemd0LvL7S/Dzb2yQdCXxb0l227+notxhYDDBz5szRLCkiYtJrMkj9raFl25tt31ltG8E2dr0UNaNs6zz+ycCfAQtsP1Z5r23lv5uAG4FjOvvaXmG713ZvT09Pg5IiIqKpYQNC0sGSngscJulQSc8tX7MY+VLRkLXAHEmzJU0FFgG7fBtJ0jHAJynC4f5K+6GSDiqXDwOOBzbs5c8WERFPwUiXmP4IeDfFPRDrAJXtDwMf39OBbQ9KWgKsAaYAK22vl7QM6LfdB3wIeBZwjSSAe8tvLL0E+KSknRQhdqntBERExBgaNiBsfwz4mKR32r5iXw5uezWwuqPtksryycP0+1fg5fvynhERMTqaDFJfIellFPcyHFxpz53UERET2B4DoryT+kSKgFhNcePbd8hUGxERE1prd1JHRMT+rc07qSMiYj/WZDbXzjupf0GzO6kjImI/Ni7upI6IiPFn2ICQdOxI22zf1k5JERExHox0BvHh8t+DKeZJ+h7FzXKvAPqB17RbWkREdNOwg9S232D7DcB9wLHlnEfHUcyJtNucShERMbE0+RbTi2zfNbRi+/sUU2FERMQE1uRbTHdKugr4m3L9rUAGqSMiJrgmAXEu8A7gwnL9n4C/bq2iiIgYF5p8zfVXwF+Wr4iImCSajEFERMQklICIiIhaIz1R7vPlvxcOt09ERExcI51BHCfpcODtHY8cfW75KNKIiJjARhqkvhL4FnAkuz5yFMBle0RETFAj3Un9V7ZfQvEs6SNtz668GoWDpPmSNkoakLS0ZvtFkjZIulPStyQ9r7LtHEk/LF/n7NNPFxER+6zJ11zfIeko4HVl0z81mc1V0hRgOXAKsBVYK6nP9obKbrcDvbZ/KekdwOXAW8pLWB+gmAPKwLqy74N788NFRMS+2+O3mCS9C/gC8J/K1xckvbPBsecBA7Y32X4cWAUsrO5g+wbbvyxXbwFmlMunAd+0vaMMhW8C85v8QBERMTqa3En934FX2X4EQNJlFA8MumIP/aYDWyrrW4FXjbD/ecA/jNB3emcHSYuBxQAzZ87cQzkREbE3mtwHIeDJyvqT7Dpg/ZRJOpvictKH9qaf7RXlLLO9PT09o1lSRMSk1+QM4jPAdyV9pVw/A/h0g37b2PXZ1TOomSZc0snAnwGvt/1Ype+JHX1vbPCeERExSvZ4BmH7IxQT9u0oX+fa/miDY68F5kiaLWkqsAjoq+4g6Rjgk8AC2/dXNq0BTi3vvzgUOLVsi4iIMdLkDILy8aJ79YhR24OSllD8Yp9C8XXZ9ZKWAf22+yguKT0LuEYSwL22F9jeIemDFCEDsMz2jr15/4iIeGoaBcS+sr0aWN3Rdkll+eQR+q4EVrZXXUREjCST9UVERK0ERERE1Gpyo9zvltNdPCTpYUk/l/TwWBQXERHd02QM4nLgd2zf3XYxERExfjS5xPTvCYeIiMmnyRlEv6S/Bb4KDN3Ihu0vt1VURER0X5OAmAb8kuJmtSEGEhARERNYk+m+zx2LQiIiYnxp8i2mGZK+Iun+8nWdpBl76hcREfu3JoPUn6GYQ+nw8vV3ZVtERExgTQKix/ZnbA+Wr88CmVs7ImKCaxIQD0g6W9KU8nU28EDbhUVERHc1CYi3A78P/BS4DziTYvrviIiYwJp8i+nHwIIxqCUiIsaRYQNC0p/avlzSFRT3PezC9rtarSwiIrpqpDOIoek1+seikIiIGF+GDQjbf1cu/tL2NdVtkt7calUREdF1TQapL27YthtJ8yVtlDQgaWnN9hMk3SZpUNKZHduelHRH+err7BsREe0aaQziTcB/BaZL+qvKpmnA4J4OLGkKsBw4BdgKrJXUZ3tDZbd7gbcB7605xKO2j97T+0RERDtGGoP4CcX4wwJgXaX958B7Ghx7HjBgexOApFXAQuDXAWF7c7lt515VHRERrRtpDOJ7wPckfQV4xPaT8Oszg4MaHHs6sKWyvhV41V7UdrCkfoqzlUttf3Uv+kZExFPUZAziG8DTK+tPB/6xnXJ28TzbvcB/Az4q6fmdO0haLKlfUv/27dvHoKSIiMmjSUAcbPsXQyvl8jMa9NsGHFFZn1G2NWJ7W/nvJuBG4JiafVbY7rXd29OT6aEiIkZTk4B4RNKxQyuSjgMebdBvLTBH0mxJU4FFFLPC7pGkQyUdVC4fBhxPZewiIiLa1+SJcu8GrpH0E0DAfwbesqdOtgclLQHWAFOAlbbXS1oG9Nvuk/RK4CvAocDvSPrftl8KvAT4ZDl4fQDFGEQCIiJiDDWZi2mtpBcDLyqbNtp+osnBba8GVne0XVI9NsWlp85+/wq8vMl7REREO5qcQUARDnOBg4FjJWH7c+2VFQGzll7f7RIA2Hzp6d0uIaIr9hgQkj4AnEgREKuBNwHfARIQERETWJNB6jOBk4Cf2j4XOAo4pNWqIiKi65oExKO2dwKDkqYB97Pr11cjImICajIG0S/pOcCnKKbc+AVwc5tFRURE940YEJIE/B/b/wFcKenrwDTbd45FcRER0T0jBoRtS1pN+ZXTocn1IiJi4mtyiek2Sa8s71mYsMbLVyojIsaLJgHxKuBsSZuBRyjuprbtV7RZWEREdNdIDwyaafte4LQxrCciIsaJkc4gvgoca/vHkq6z/XtjVFNERIwDI90HocrykW0XEhER48tIAeFhliMiYhIY6RLTUZIepjiTeHq5DL8ZpJ7WenUREdE1Iz2TespYFhIREeNLk7mYIiJiEkpARERErQRERETUajUgJM2XtFHSgKSlNdtPkHSbpEFJZ3ZsO0fSD8vXOW3WGRERu2stICRNAZZTPIFuLnCWpLkdu90LvA34Ykff5wIfoJjmYx7wAUmHtlVrRETsrs0ziHnAgO1Nth8HVgELqzvY3lxOHb6zo+9pwDdt77D9IPBNYH6LtUZERIc2A2I6sKWyvrVsa7tvRESMgv16kFrSYkn9kvq3b9/e7XIiIiaUNgNiG7s+u3pG2TZqfW2vsN1ru7enp2efC42IiN21GRBrgTmSZkuaCiwC+hr2XQOcKunQcnD61LItIiLGSGsBYXsQWELxi/1u4Grb6yUtk7QAQNIrJW0F3gx8UtL6su8O4IMUIbMWWFa2RUTEGGnyRLl9Zns1sLqj7ZLK8lqKy0d1fVcCK9usLyIihrdfD1JHRER7EhAREVErAREREbUSEBERUSsBERERtRIQERFRKwERERG1EhAREVErAREREbUSEBERUSsBERERtRIQERFRKwERERG1EhAREVErAREREbUSEBERUSsBERERtRIQERFRq9WAkDRf0kZJA5KW1mw/SNLfltu/K2lW2T5L0qOS7ihfV7ZZZ0RE7K61Z1JLmgIsB04BtgJrJfXZ3lDZ7TzgQdsvkLQIuAx4S7ntHttHt1VfRESMrM0ziHnAgO1Nth8HVgELO/ZZCPy/cvla4CRJarGmiIhoqM2AmA5sqaxvLdtq97E9CDwE/Fa5bbak2yXdJOl1LdYZERE1WrvE9BTdB8y0/YCk44CvSnqp7YerO0laDCwGmDlzZhfKjIiYuNoMiG3AEZX1GWVb3T5bJR0IHAI8YNvAYwC210m6B3gh0F/tbHsFsAKgt7fXbfwQEbOWXt/tEgDYfOnp3S4hJpk2LzGtBeZImi1pKrAI6OvYpw84p1w+E/i2bUvqKQe5kXQkMAfY1GKtERHRobUzCNuDkpYAa4ApwErb6yUtA/pt9wGfBj4vaQDYQREiACcAyyQ9AewEzre9o61aIyJid62OQdheDazuaLuksvwr4M01/a4DrmuztoiIGFnupI6IiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKiVgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCIiIhaCYiIiKjV6iNHJc0HPkbxTOqrbF/asf0g4HPAccADwFtsby63XQycBzwJvMv2mjZrjRjvZi29vtslALD50tO7XUKMkdbOICRNAZYDbwLmAmdJmtux23nAg7ZfAPwlcFnZdy6wCHgpMB/4RHm8iIgYI22eQcwDBmxvApC0ClgIbKjssxD483L5WuDjklS2r7L9GPAjSQPl8W5usd6IaGA8nMnkLGZstDkGMR3YUlnfWrbV7mN7EHgI+K2GfSMiokWtjkG0TdJiYHG5+gtJG5/C4Q4DfvbUq5oQ8lnsKp/Hrrr+eeiybr77Lrr+WYyC5w23oc2A2AYcUVmfUbbV7bNV0oHAIRSD1U36YnsFsGI0ipXUb7t3NI61v8tnsat8HrvK5/EbE/2zaPMS01pgjqTZkqZSDDr3dezTB5xTLp8JfNu2y/ZFkg6SNBuYA9zaYq0REdGhtTMI24OSlgBrKL7mutL2eknLgH7bfcCngc+Xg9A7KEKEcr+rKQa0B4ELbD/ZVq0REbE7FX+wh6TF5SWrSS+fxa7yeewqn8dvTPTPIgERERG1MtVGRETUmvQBIWm+pI2SBiQt7XY93STpCEk3SNogab2kC7tdU7dJmiLpdkl/3+1auk3ScyRdK+kHku6W9Jpu19RNkt5T/n/yfUlfknRwt2sabZM6IBpOBzKZDAJ/bHsu8Grggkn+eQBcCNzd7SLGiY8BX7f9YuAoJvHnImk68C6g1/bLKL6Is6i7VY2+SR0QVKYDsf04MDQdyKRk+z7bt5XLP6f4BTBp72CXNAM4Hbiq27V0m6RDgBMovnmI7cdt/0dXi+q+A4Gnl/dwPQP4SZfrGXWTPSAypccwJM0CjgG+2+VSuumjwJ8CO7tcx3gwG9gOfKa85HaVpGd2u6husb0N+L/AvcB9wEO2v9HdqkbfZA+IqCHpWcB1wLttP9zterpB0m8D99te1+1axokDgWOBv7Z9DPAIMGnH7CQdSnG1YTZwOPBMSWd3t6rRN9kDotGUHpOJpKdRhMMXbH+52/V00fHAAkmbKS49vlHS33S3pK7aCmy1PXRGeS1FYExWJwM/sr3d9hPAl4HXdrmmUTfZA6LJdCCTRjnV+qeBu21/pNv1dJPti23PsD2L4r+Lb9uecH8hNmX7p8AWSS8qm05i16n7J5t7gVdLekb5/81JTMBB+/16NtenarjpQLpcVjcdD/wBcJekO8q2/2V7dfdKinHkncAXyj+mNgHndrmerrH9XUnXArdRfPvvdkZp4tDxJHdSR0RErcl+iSkiIoaRgIiIiFoJiIiIqJWAiIiIWgmIiIiolYCI/ZokS/pwZf29kv58lI79WUlnjsax9vA+by5nR72ho32WpO/voe+JezvTrKQbJU3Y5yjH6ElAxP7uMeB3JR3W7UKqygncmjoP+B+239BWPRH7IgER+7tBihuU3tO5ofMMQNIvyn9PlHSTpK9J2iTpUklvlXSrpLskPb9ymJMl9Uv6t3J+pqFnRHxI0lpJd0r6o8px/1lSHzV3GUs6qzz+9yVdVrZdAvwX4NOSPjTcD1meTfyzpNvKV3Vah2mSri+fa3KlpAPKPqdKurnc/5pyjq3qMaeUn9H3y7p2+wxjcpvUd1LHhLEcuFPS5XvR5yjgJcAOiruCr7I9r3xI0juBd5f7zaKYFv75wA2SXgD8IcXsna+UdBDwL5KGZvI8FniZ7R9V30zS4cBlwHHAg8A3JJ1he5mkNwLvtd0/Qr33A6fY/pWkOcCXgKHLRPMonmfyY+DrFGdUNwLvB062/Yik9wEXAcsqxzwamF4+zwBJz9nzxxaTSQIi9nu2H5b0OYoHuDzasNta2/cBSLoHGPoFfxdQvdRzte2dwA8lbQJeDJwKvKJydnIIMAd4HLi1MxxKrwRutL29fM8vUDxf4asN630a8HFJRwNPAi+sbLvV9qbyuF+iOCP5FUVo/EsxVRBTgZs7jrkJOFLSFcD1lc8gAkhAxMTxUYp5cT5TaRukvIxaXnaZWtn2WGV5Z2V9J7v+f9E5F40BAe+0vaa6QdKJFNNgt+E9wL9TnPkcQBEAe6rxm7bPGu6Ath+UdBRwGnA+8PvA20ez6Ni/ZQwiJgTbO4CrKQZ8h2ymuKQDsIDir/C99WZJB5TjEkcCGykmd3xHOTU6kl7Y4OE5twKvl3RY+ajbs4Cb9qKOQ4D7yrOZP6CYXHLIvHJG4gOAtwDfAW4Bji8viSHpmZKqZx2UA/sH2L6O4nLUZJ6+O2rkDCImkg8DSyrrnwK+Jul7FNfm9+Wv+3spfrlPA84vxwCuohibuK2c6nk7cMZIB7F9n6SlwA0Uf91fb/tre1HHJ4DrJP0hu/8sa4GPAy8oj/8V2zslvQ34UjlOAkUI/Ful33SKJ8QN/aF48V7UE5NAZnONiIhaucQUERG1EhAREVErAREREbUSEBERUSsBERERtRIQERFRKwERERG1EhAREVHr/wNz6iW246KpNQAAAABJRU5ErkJggg==\n",
+      "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "%matplotlib inline\n",
+    "\n",
+    "\n",
+    "def plot_label_frequency(L):\n",
+    "    plt.hist((L != ABSTAIN).sum(axis=1), density=True, bins=range(L.shape[1]))\n",
+    "    plt.xlabel(\"Number of labels\")\n",
+    "    plt.ylabel(\"Fraction of dataset\")\n",
+    "    plt.show()\n",
+    "\n",
+    "\n",
+    "plot_label_frequency(L_train)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "We see that over half of our `train` dataset data points have 2 or fewer labels from LFs.\n",
+    "Fortunately, the labels we do have can be used to train a classifier over the comment text directly, allowing this final machine learning model to generalize beyond what our labeling functions labeling."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Our goal is now to convert the labels from our LFs into a single _noise-aware_ probabilistic (or confidence-weighted) label per data point.\n",
+    "A simple baseline for doing this is to take the majority vote on a per-data point basis: if more LFs voted SPAM than HAM, label it SPAM (and vice versa).\n",
+    "We can test this with the\n",
+    "[`MajorityLabelVoter` baseline model](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.model.baselines.MajorityLabelVoter.html#snorkel.labeling.model.baselines.MajorityLabelVoter)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling.model import MajorityLabelVoter\n",
+    "\n",
+    "majority_model = MajorityLabelVoter()\n",
+    "preds_train = majority_model.predict(L=L_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "array([-1,  1, -1, ...,  1,  1,  1])"
+      ]
+     },
+     "execution_count": 35,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "preds_train"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "However, as we can see from the summary statistics of our LFs in the previous section, they have varying properties and should not be treated identically. In addition to having varied accuracies and coverages, LFs may be correlated, resulting in certain signals being overrepresented in a majority-vote-based model. To handle these issues appropriately, we will instead use a more sophisticated Snorkel `LabelModel` to combine the outputs of the LFs.\n",
+    "\n",
+    "This model will ultimately produce a single set of noise-aware training labels, which are probabilistic or confidence-weighted labels. We will then use these labels to train a classifier for our task. For more technical details of this overall approach, see our [NeurIPS 2016](https://arxiv.org/abs/1605.07723) and [AAAI 2019](https://arxiv.org/abs/1810.02840) papers. For more info on the API, see the [`LabelModel` documentation](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.model.label_model.LabelModel.html#snorkel.labeling.model.label_model.LabelModel).\n",
+    "\n",
+    "Note that no gold labels are used during the training process.\n",
+    "The only information we need is the label matrix, which contains the output of the LFs on our training set.\n",
+    "The `LabelModel` is able to learn weights for the labeling functions using only the label matrix as input.\n",
+    "We also specify the `cardinality`, or number of classes."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling.model import LabelModel\n",
+    "\n",
+    "label_model = LabelModel(cardinality=2, verbose=True)\n",
+    "label_model.fit(L_train=L_train, n_epochs=500, log_freq=100, seed=123)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Majority Vote Accuracy:   84.0%\n",
+      "Label Model Accuracy:     86.0%\n"
+     ]
+    }
+   ],
+   "source": [
+    "majority_acc = majority_model.score(L=L_test, Y=Y_test, tie_break_policy=\"random\")[\n",
+    "    \"accuracy\"\n",
+    "]\n",
+    "print(f\"{'Majority Vote Accuracy:':<25} {majority_acc * 100:.1f}%\")\n",
+    "\n",
+    "label_model_acc = label_model.score(L=L_test, Y=Y_test, tie_break_policy=\"random\")[\n",
+    "    \"accuracy\"\n",
+    "]\n",
+    "print(f\"{'Label Model Accuracy:':<25} {label_model_acc * 100:.1f}%\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The majority vote model or more sophisticated `LabelModel` could in principle be used directly as a classifier if the outputs of our labeling functions were made available at test time.\n",
+    "However, these models (i.e. these re-weighted combinations of our labeling function's votes) will abstain on the data points that our labeling functions don't cover (and additionally, may require slow or unavailable features to execute at test time).\n",
+    "In the next section, we will instead use the outputs of the `LabelModel` as training labels to train a discriminative classifier **which can generalize beyond the labeling function outputs** to see if we can improve performance further.\n",
+    "This classifier will also only need the text of the comment to make predictions, making it much more suitable for inference over unseen comments.\n",
+    "For more information on the properties of the label model, see the [Snorkel documentation](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.model.label_model.LabelModel.html#snorkel.labeling.model.label_model.LabelModel)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "source": [
+    "Let's briefly confirm that the labels the `LabelModel` produces are indeed probabilistic in nature.\n",
+    "The following histogram shows the confidences we have that each data point has the label SPAM.\n",
+    "The points we are least certain about will have labels close to 0.5."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "metadata": {
+    "tags": [
+     "md-exclude"
+    ]
+   },
+   "outputs": [
+    {
+     "data": {
+      "image/png": "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\n",
+      "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "\n",
+    "\n",
+    "def plot_probabilities_histogram(Y):\n",
+    "    plt.hist(Y, bins=10)\n",
+    "    plt.xlabel(\"Probability of SPAM\")\n",
+    "    plt.ylabel(\"Number of data points\")\n",
+    "    plt.show()\n",
+    "\n",
+    "\n",
+    "probs_train = label_model.predict_proba(L=L_train)\n",
+    "plot_probabilities_histogram(probs_train[:, SPAM])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Filtering out unlabeled data points"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we saw earlier, some of the data points in our `train` set received no labels from any of our LFs.\n",
+    "These data points convey no supervision signal and tend to hurt performance, so we filter them out before training using a\n",
+    "[built-in utility](https://snorkel.readthedocs.io/en/master/packages/_autosummary/labeling/snorkel.labeling.filter_unlabeled_dataframe.html#snorkel.labeling.filter_unlabeled_dataframe)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.labeling import filter_unlabeled_dataframe\n",
+    "\n",
+    "df_train_filtered, probs_train_filtered = filter_unlabeled_dataframe(\n",
+    "    X=df_train, y=probs_train, L=L_train\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Training a Classifier"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this final section of the tutorial, we'll use the probabilistic training labels we generated in the last section to train a classifier for our task.\n",
+    "**The output of the Snorkel `LabelModel` is just a set of labels which can be used with most popular libraries for performing supervised learning, such as TensorFlow, Keras, PyTorch, Scikit-Learn, Ludwig, and XGBoost.**\n",
+    "In this tutorial, we use the well-known library [Scikit-Learn](https://scikit-learn.org).\n",
+    "**Note that typically, Snorkel is used (and really shines!) with much more complex, training data-hungry models, but we will use Logistic Regression here for simplicity of exposition.**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Featurization"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For simplicity and speed, we use a simple \"bag of n-grams\" feature representation: each data point is represented by a one-hot vector marking which words or 2-word combinations are present in the comment text."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [],
+   "source": [
+    "from sklearn.feature_extraction.text import CountVectorizer\n",
+    "\n",
+    "vectorizer = CountVectorizer(ngram_range=(1, 5))\n",
+    "X_train = vectorizer.fit_transform(df_train_filtered.text.tolist())\n",
+    "X_test = vectorizer.transform(df_test.text.tolist())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Scikit-Learn Classifier"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we saw in Section 4, the `LabelModel` outputs probabilistic (float) labels.\n",
+    "If the classifier we are training accepts target labels as floats, we can train on these labels directly (see describe the properties of this type of \"noise-aware\" loss in our [NeurIPS 2016 paper](https://arxiv.org/abs/1605.07723)).\n",
+    "\n",
+    "If we want to use a library or model that doesn't accept probabilistic labels (such as Scikit-Learn), we can instead replace each label distribution with the label of the class that has the maximum probability.\n",
+    "This can easily be done using the\n",
+    "[`probs_to_preds` helper method](https://snorkel.readthedocs.io/en/master/packages/_autosummary/utils/snorkel.utils.probs_to_preds.html#snorkel.utils.probs_to_preds).\n",
+    "We do note, however, that this transformation is lossy, as we no longer have values for our confidence in each label."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from snorkel.utils import probs_to_preds\n",
+    "\n",
+    "preds_train_filtered = probs_to_preds(probs=probs_train_filtered)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We then use these labels to train a classifier as usual."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {
+    "tags": [
+     "md-exclude-output"
+    ]
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "LogisticRegression(C=1000.0, solver='liblinear')"
+      ]
+     },
+     "execution_count": 42,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "from sklearn.linear_model import LogisticRegression\n",
+    "\n",
+    "sklearn_model = LogisticRegression(C=1e3, solver=\"liblinear\")\n",
+    "sklearn_model.fit(X=X_train, y=preds_train_filtered)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Test Accuracy: 93.6%\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(f\"Test Accuracy: {sklearn_model.score(X=X_test, y=Y_test) * 100:.1f}%\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**We observe an additional boost in accuracy over the `LabelModel` by multiple points! This is in part because the discriminative model generalizes beyond the labeling function's labels and makes good predictions on all data points, not just the ones covered by labeling functions.\n",
+    "By using the label model to transfer the domain knowledge encoded in our LFs to the discriminative model,\n",
+    "we were able to generalize beyond the noisy labeling heuristics**."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Summary"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this tutorial, we accomplished the following:\n",
+    "* We introduced the concept of Labeling Functions (LFs) and demonstrated some of the forms they can take.\n",
+    "* We used the Snorkel `LabelModel` to automatically learn how to combine the outputs of our LFs into strong probabilistic labels.\n",
+    "* We showed that a classifier trained on a weakly supervised dataset can outperform an approach based on the LFs alone as it learns to generalize beyond the noisy heuristics we provide."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Next Steps"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "If you enjoyed this tutorial and you've already checked out the [Getting Started](https://snorkel.org/get-started/) tutorial, check out the [Tutorials](https://snorkel.org/use-cases/) page for other tutorials that you may find interesting, including demonstrations of how to use Snorkel\n",
+    "\n",
+    "* As part of a [hybrid crowdsourcing pipeline](https://snorkel.org/use-cases/crowdsourcing-tutorial)\n",
+    "* For [visual relationship detection over images](https://snorkel.org/use-cases/visual-relation-tutorial)\n",
+    "* For [information extraction over text](https://snorkel.org/use-cases/spouse-demo)\n",
+    "* For [data augmentation](https://snorkel.org/use-cases/02-spam-data-augmentation-tutorial)\n",
+    "\n",
+    "and more!\n",
+    "You can also visit the [Snorkel website](https://snorkel.org) or [Snorkel API documentation](https://snorkel.readthedocs.io) for more info!"
+   ]
+  }
+ ],
+ "metadata": {
+  "jupytext": {
+   "cell_metadata_filter": "tags,-all",
+   "encoding": "# -*- coding: utf-8 -*-"
+  },
+  "kernelspec": {
+   "display_name": "TensorFlow 2.7 on Python 3.8 & CUDA 11.3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
