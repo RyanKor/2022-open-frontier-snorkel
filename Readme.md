@@ -58,38 +58,38 @@ Vision / NLP 중심으로 데이터셋 검증 --> 개인적으로 월별로 데�
 
 버그리포트나 트러블 슈팅, 성능 개선은 부차적인 이슈가 될 것
 
-###3월
+### 3월
 * 2 종류 논문의 꼼꼼한 리뷰 및 연구 개발 계획 수립
 * Snorkel: Rapid Training Data Creation with Weak Supervision
 * End-to-End Weak Supervision
 * Snorkel Use Case Intro Dataset 테스트
 
-###4월
+### 4월
 * 1 종류 논문의 꼼꼼한 리뷰 및 Labeling 방향성 분석
   * Data Programming: Creating Large Training Set, Quickly
 * Snorkel Hybrid Labeling Use Case 분석
 * 국내 AI Hub의 K-Fashion 데이터를 토대로 Labeling 되어 있는 데이터와 Sampling을 통한 일부 Labeling이 되어 있지 않는 데이터로 Snorkel Labeling 성능 검증 (국내 데이터로 Hybrid Labeling 성능 검증)
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###5월
+### 5월
 * Snorkel Visual Relationship Labeling Use Case 분석
 * COCO Dataset 을 이용한 Visual Relationship Labeling 성능 검증
 * Faster R-CNN, YOLO 모델 등 다양한 객체 탐지 모델을 통한 성능 검증 진행
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###6월
+### 6월
 * 자율 주행 도로 장애물 / 표면 인지 영상(수도권) 데이터를 이용한 Visual Relationship Labeling 성능 검증
 * Faster R-CNN, YOLO 모델 등 다양한 객체 탐지 모델을 통한 성능 검증 진행
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###7월
+### 7월
 * 1 종류 논문의 꼼꼼한 리뷰 및 Data Augmentation Labeling 방향성 분석
   * Learning to Compose Domain-Specific Transformations for Data Augmentation
 * Snorkel Data Augmentation Use Case 분석
 * 국/영문 SNS dataset을 토대로 Data Augmentation 부분 Snorkel 성능 검증
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###8월
+### 8월
 * 1 종류 논문의 꼼꼼한 리뷰 및 NLP Labeling 방향성 분석
   * Training Classifiers with Natural Language Explanations
 * Snorkel NLP Use Case 분석
@@ -97,23 +97,23 @@ Vision / NLP 중심으로 데이터셋 검증 --> 개인적으로 월별로 데�
 * Naver Deview, pycon 연사 신청
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###9월
+### 9월
 * 1 종류 논문의 꼼꼼한 리뷰 및 Multi-Task Labeling 방향성 분석
   * Training Complex Models with Multi-Task Weak Supervision
 * Multi-Task Learning Tutorial 수행
 * Snorkel 내에서 단일 모델에 대한 Multi-Task 수행 성능 검증 진행
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###10월 (내용 보충 필요)
+### 10월 (내용 보충 필요)
 * Snorkel RecSys Use Case 분석
 * Recommender System Public Dataset 중 선택해 Snorkel Labeling 성능 검증 (국내 추천 시스템 관련 공개 데이터셋 부재)
 * 실험 데이터 보고서 작성 (실습 환경, 검증 사항, Snorkel / Human-Labeling 성능 비교 등)
 
-###11월 (내용 보충 필요)
+### 11월 (내용 보충 필요)
 * 실험 데이터 보고서 영문 번역 (총 7편)
 * Snorkel Team 과 공유 및 향후 방향성 논의 진행
 
-###12월
+### 12월
 * Snorkel 데이터 라벨링 연구 개발 보고서 및 국내 도입 시사점 정리
 * 최종 성과 공유
 
